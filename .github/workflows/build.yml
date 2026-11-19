@@ -1,0 +1,127 @@
+# .github/workflows/debian-build.yml
+name: build-debian
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------
+  # amd64 builds: Debian stable/testing/unstable × gcc/clang
+  # ---------------------------------------------------------------
+  build:
+    name: ${{ matrix.debian }} / ${{ matrix.compiler }} (amd64)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        debian:   [bookworm, trixie, sid]
+        compiler: [gcc, clang]
+    container:
+      image: debian:${{ matrix.debian }}
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential clang ca-certificates file
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Compile src/downman.c
+        run: |
+          mkdir -p build
+          ${{ matrix.compiler }} -std=c11 -O2 \
+              -Wall -Wextra -Wpedantic \
+              -o build/downman src/downman.c
+
+      - name: Smoke test
+        run: |
+          file build/downman
+          ./build/downman --help > /dev/null
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: downman-${{ matrix.debian }}-${{ matrix.compiler }}-amd64
+          path: build/downman
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------
+  # arm64 build on Debian stable (via QEMU user-mode emulation)
+  # Remove this job if you only need amd64.
+  # ---------------------------------------------------------------
+  build-arm64:
+    name: ${{ matrix.debian }} / gcc (arm64)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        debian: [bookworm]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build inside debian:arm64
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD":/src -w /src \
+            debian:${{ matrix.debian }} \
+            bash -c '
+              apt-get update &&
+              apt-get install -y --no-install-recommends \
+                build-essential ca-certificates file &&
+              mkdir -p build &&
+              cc -std=c11 -O2 -Wall -Wextra -Wpedantic \
+                 -o build/downman src/downman.c &&
+              file build/downman &&
+              ./build/downman --help > /dev/null
+            '
+          # Container runs as root; fix ownership so artifact upload works.
+          sudo chown -R "$(id -u):$(id -g)" build
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: downman-${{ matrix.debian }}-gcc-arm64
+          path: build/downman
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------
+  # Optional strict-warnings job (fails on any warning).
+  # Skipped on clang because -Wno-format-truncation is gcc-only.
+  # ---------------------------------------------------------------
+  build-strict:
+    name: strict-warnings (bookworm / gcc)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Build with -Werror
+        run: |
+          mkdir -p build
+          # -Wno-format-truncation silences a false positive in
+          # snprintf(progname_buf, ..., "%s", argv[0]) — argv[0] has
+          # unknown length at compile time, so gcc may warn even
+          # though we handle truncation safely.
+          gcc -std=c11 -O2 -Wall -Wextra -Wpedantic -Werror \
+              -Wno-format-truncation \
+              -o build/downman src/downman.c
